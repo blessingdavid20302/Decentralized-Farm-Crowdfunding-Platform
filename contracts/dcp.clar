@@ -277,3 +277,112 @@
     )
   )
 )
+
+
+
+(define-map campaign-updates
+  { campaign-id: uint, update-id: uint }
+  {
+    title: (string-ascii 100),
+    content: (string-ascii 500),
+    timestamp: uint
+  }
+)
+
+(define-map campaign-update-counts
+  { campaign-id: uint }
+  { count: uint }
+)
+
+(define-public (post-campaign-update (campaign-id uint) (title (string-ascii 100)) (content (string-ascii 500)))
+  (let
+    (
+      (campaign (unwrap! (get-campaign campaign-id) err-not-found))
+      (update-count-data (default-to { count: u0 } (map-get? campaign-update-counts { campaign-id: campaign-id })))
+      (new-update-id (+ (get count update-count-data) u1))
+    )
+    
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    
+    (map-set campaign-updates
+      { campaign-id: campaign-id, update-id: new-update-id }
+      {
+        title: title,
+        content: content,
+        timestamp: stacks-block-height
+      }
+    )
+    
+    (map-set campaign-update-counts
+      { campaign-id: campaign-id }
+      { count: new-update-id }
+    )
+    
+    (ok new-update-id)
+  )
+)
+
+(define-read-only (get-campaign-update (campaign-id uint) (update-id uint))
+  (match (map-get? campaign-updates { campaign-id: campaign-id, update-id: update-id })
+    update (ok update)
+    err-not-found
+  )
+)
+
+
+(define-constant valid-categories (list 
+  "technology"
+  "art"
+  "music"
+  "film"
+  "games"
+  "publishing"
+))
+
+(define-map campaign-categories
+  { campaign-id: uint }
+  { category: (string-ascii 20) }
+)
+
+(define-map category-campaigns
+  { category: (string-ascii 20) }
+  { campaigns: (list 100 uint) }
+)
+
+(define-public (set-campaign-category (campaign-id uint) (category (string-ascii 10)))
+  (let
+    (
+      (campaign (unwrap! (get-campaign campaign-id) err-not-found))
+      (category-data (default-to { campaigns: (list) } (map-get? category-campaigns { category: category })))
+    )
+    
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (asserts! (is-some (index-of valid-categories category)) (err u118))
+    
+    (map-set campaign-categories
+      { campaign-id: campaign-id }
+      { category: category }
+    )
+    
+    (map-set category-campaigns
+      { category: category }
+      { campaigns: (unwrap! (as-max-len? (append (get campaigns category-data) campaign-id) u100) (err u119)) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-campaign-category (campaign-id uint))
+  (match (map-get? campaign-categories { campaign-id: campaign-id })
+    category (ok category)
+    err-not-found
+  )
+)
+
+(define-read-only (get-campaigns-by-category (category (string-ascii 20)))
+  (match (map-get? category-campaigns { category: category })
+    result (ok result)
+    err-not-found
+  )
+)
