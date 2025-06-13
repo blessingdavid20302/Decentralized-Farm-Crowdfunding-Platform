@@ -6,6 +6,16 @@
 (define-constant err-insufficient-funds (err u104))
 (define-constant err-campaign-inactive (err u105))
 (define-constant err-campaign-active (err u106))
+
+
+(define-constant err-milestone-not-found (err u200))
+(define-constant err-milestone-already-completed (err u201))
+(define-constant err-insufficient-milestone-funds (err u202))
+(define-constant err-milestone-not-approved (err u203))
+(define-constant err-already-voted (err u204))
+(define-constant err-invalid-milestone-percentage (err u205))
+
+
 (define-constant err-funding-goal-reached (err u107))
 (define-constant err-funding-goal-not-reached (err u108))
 (define-constant err-deadline-not-reached (err u109))
@@ -383,6 +393,196 @@
 (define-read-only (get-campaigns-by-category (category (string-ascii 20)))
   (match (map-get? category-campaigns { category: category })
     result (ok result)
+    err-not-found
+  )
+)
+
+
+
+(define-map campaign-milestones
+  { campaign-id: uint, milestone-id: uint }
+  {
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    funding-percentage: uint,
+    is-completed: bool,
+    is-approved: bool,
+    votes-for: uint,
+    votes-against: uint,
+    total-eligible-voters: uint
+  }
+)
+
+(define-map milestone-counts
+  { campaign-id: uint }
+  { count: uint }
+)
+
+(define-map milestone-votes
+  { campaign-id: uint, milestone-id: uint, voter: principal }
+  { vote: bool }
+)
+
+(define-map campaign-milestone-funds
+  { campaign-id: uint }
+  { 
+    total-locked: uint,
+    total-released: uint
+  }
+)
+
+(define-public (create-milestone (campaign-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (funding-percentage uint))
+  (let
+    (
+      (campaign (unwrap! (contract-call? .dcp get-campaign campaign-id) err-not-found))
+      (milestone-count-data (default-to { count: u0 } (map-get? milestone-counts { campaign-id: campaign-id })))
+      (new-milestone-id (+ (get count milestone-count-data) u1))
+    )
+    
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (asserts! (get is-active campaign) err-campaign-inactive)
+    (asserts! (and (> funding-percentage u0) (<= funding-percentage u100)) err-invalid-milestone-percentage)
+    
+    (map-set campaign-milestones
+      { campaign-id: campaign-id, milestone-id: new-milestone-id }
+      {
+        title: title,
+        description: description,
+        funding-percentage: funding-percentage,
+        is-completed: false,
+        is-approved: false,
+        votes-for: u0,
+        votes-against: u0,
+        total-eligible-voters: u0
+      }
+    )
+    
+    (map-set milestone-counts
+      { campaign-id: campaign-id }
+      { count: new-milestone-id }
+    )
+    
+    (ok new-milestone-id)
+  )
+)
+
+(define-public (complete-milestone (campaign-id uint) (milestone-id uint))
+  (let
+    (
+      (campaign (unwrap! (contract-call? .dcp get-campaign campaign-id) err-not-found))
+      (milestone (unwrap! (get-milestone campaign-id milestone-id) err-milestone-not-found))
+      (contributors-data (unwrap! (contract-call? .dcp get-campaign-contributors campaign-id) err-not-found))
+      (contributor-count (len (get contributors contributors-data)))
+    )
+    
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (asserts! (not (get is-completed milestone)) err-milestone-already-completed)
+    (asserts! (>= (get total-raised campaign) (get funding-goal campaign)) err-funding-goal-not-reached)
+    
+    (map-set campaign-milestones
+      { campaign-id: campaign-id, milestone-id: milestone-id }
+      (merge milestone { 
+        is-completed: true,
+        total-eligible-voters: contributor-count
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (vote-milestone (campaign-id uint) (milestone-id uint) (approve bool))
+  (let
+    (
+      (milestone (unwrap! (get-milestone campaign-id milestone-id) err-milestone-not-found))
+      (contribution (unwrap! (contract-call? .dcp get-contribution campaign-id tx-sender) err-not-found))
+      (existing-vote (map-get? milestone-votes { campaign-id: campaign-id, milestone-id: milestone-id, voter: tx-sender }))
+    )
+    
+    (asserts! (is-none existing-vote) err-already-voted)
+    (asserts! (get is-completed milestone) (err u206))
+    (asserts! (not (get is-approved milestone)) err-milestone-already-completed)
+    (asserts! (> (get amount contribution) u0) err-unauthorized)
+    
+    (map-set milestone-votes
+      { campaign-id: campaign-id, milestone-id: milestone-id, voter: tx-sender }
+      { vote: approve }
+    )
+    
+    (if approve
+      (map-set campaign-milestones
+        { campaign-id: campaign-id, milestone-id: milestone-id }
+        (merge milestone { votes-for: (+ (get votes-for milestone) u1) })
+      )
+      (map-set campaign-milestones
+        { campaign-id: campaign-id, milestone-id: milestone-id }
+        (merge milestone { votes-against: (+ (get votes-against milestone) u1) })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (release-milestone-funds (campaign-id uint) (milestone-id uint))
+  (let
+    (
+      (campaign (unwrap! (contract-call? .dcp get-campaign campaign-id) err-not-found))
+      (milestone (unwrap! (get-milestone campaign-id milestone-id) err-milestone-not-found))
+      (fund-data (default-to { total-locked: u0, total-released: u0 } (map-get? campaign-milestone-funds { campaign-id: campaign-id })))
+      (total-raised (get total-raised campaign))
+      (milestone-amount (/ (* total-raised (get funding-percentage milestone)) u100))
+      (approval-threshold (/ (get total-eligible-voters milestone) u2))
+    )
+    
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (asserts! (get is-completed milestone) (err u207))
+    (asserts! (> (get votes-for milestone) approval-threshold) err-milestone-not-approved)
+    (asserts! (not (get is-approved milestone)) err-milestone-already-completed)
+    
+    (map-set campaign-milestones
+      { campaign-id: campaign-id, milestone-id: milestone-id }
+      (merge milestone { is-approved: true })
+    )
+    
+    (map-set campaign-milestone-funds
+      { campaign-id: campaign-id }
+      { 
+        total-locked: (get total-locked fund-data),
+        total-released: (+ (get total-released fund-data) milestone-amount)
+      }
+    )
+    
+    (try! (as-contract (stx-transfer? milestone-amount tx-sender (get owner campaign))))
+    
+    (ok milestone-amount)
+  )
+)
+
+(define-read-only (get-milestone (campaign-id uint) (milestone-id uint))
+  (match (map-get? campaign-milestones { campaign-id: campaign-id, milestone-id: milestone-id })
+    milestone (ok milestone)
+    err-milestone-not-found
+  )
+)
+
+(define-read-only (get-milestone-count (campaign-id uint))
+  (match (map-get? milestone-counts { campaign-id: campaign-id })
+    count (ok count)
+    (ok { count: u0 })
+  )
+)
+
+(define-read-only (get-milestone-funds (campaign-id uint))
+  (match (map-get? campaign-milestone-funds { campaign-id: campaign-id })
+    funds (ok funds)
+    (ok { total-locked: u0, total-released: u0 })
+  )
+)
+
+(define-read-only (get-user-milestone-vote (campaign-id uint) (milestone-id uint) (voter principal))
+  (match (map-get? milestone-votes { campaign-id: campaign-id, milestone-id: milestone-id, voter: voter })
+    vote (ok vote)
     err-not-found
   )
 )
