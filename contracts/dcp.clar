@@ -14,6 +14,9 @@
 (define-constant err-milestone-not-approved (err u203))
 (define-constant err-already-voted (err u204))
 (define-constant err-invalid-milestone-percentage (err u205))
+(define-constant err-invalid-rating (err u206))
+(define-constant err-already-reviewed (err u207))
+(define-constant err-campaign-not-ended (err u208))
 
 
 (define-constant err-funding-goal-reached (err u107))
@@ -434,7 +437,7 @@
 (define-public (create-milestone (campaign-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (funding-percentage uint))
   (let
     (
-      (campaign (unwrap! (contract-call? .dcp get-campaign campaign-id) err-not-found))
+      (campaign (unwrap! (get-campaign campaign-id) err-not-found))
       (milestone-count-data (default-to { count: u0 } (map-get? milestone-counts { campaign-id: campaign-id })))
       (new-milestone-id (+ (get count milestone-count-data) u1))
     )
@@ -469,9 +472,9 @@
 (define-public (complete-milestone (campaign-id uint) (milestone-id uint))
   (let
     (
-      (campaign (unwrap! (contract-call? .dcp get-campaign campaign-id) err-not-found))
+      (campaign (unwrap! (get-campaign campaign-id) err-not-found))
       (milestone (unwrap! (get-milestone campaign-id milestone-id) err-milestone-not-found))
-      (contributors-data (unwrap! (contract-call? .dcp get-campaign-contributors campaign-id) err-not-found))
+      (contributors-data (unwrap! (get-campaign-contributors campaign-id) err-not-found))
       (contributor-count (len (get contributors contributors-data)))
     )
     
@@ -495,7 +498,7 @@
   (let
     (
       (milestone (unwrap! (get-milestone campaign-id milestone-id) err-milestone-not-found))
-      (contribution (unwrap! (contract-call? .dcp get-contribution campaign-id tx-sender) err-not-found))
+      (contribution (unwrap! (get-contribution campaign-id tx-sender) err-not-found))
       (existing-vote (map-get? milestone-votes { campaign-id: campaign-id, milestone-id: milestone-id, voter: tx-sender }))
     )
     
@@ -527,7 +530,7 @@
 (define-public (release-milestone-funds (campaign-id uint) (milestone-id uint))
   (let
     (
-      (campaign (unwrap! (contract-call? .dcp get-campaign campaign-id) err-not-found))
+      (campaign (unwrap! (get-campaign campaign-id) err-not-found))
       (milestone (unwrap! (get-milestone campaign-id milestone-id) err-milestone-not-found))
       (fund-data (default-to { total-locked: u0, total-released: u0 } (map-get? campaign-milestone-funds { campaign-id: campaign-id })))
       (total-raised (get total-raised campaign))
@@ -584,5 +587,251 @@
   (match (map-get? milestone-votes { campaign-id: campaign-id, milestone-id: milestone-id, voter: voter })
     vote (ok vote)
     err-not-found
+  )
+)
+
+(define-map campaign-reviews
+  { campaign-id: uint, reviewer: principal }
+  {
+    rating: uint,
+    review-text: (string-ascii 300),
+    timestamp: uint
+  }
+)
+
+(define-map campaign-ratings
+  { campaign-id: uint }
+  {
+    total-rating: uint,
+    review-count: uint,
+    average-rating: uint
+  }
+)
+
+(define-public (submit-review (campaign-id uint) (rating uint) (review-text (string-ascii 300)))
+  (let
+    (
+      (campaign (unwrap! (get-campaign campaign-id) err-not-found))
+      (contribution (unwrap! (get-contribution campaign-id tx-sender) err-not-found))
+      (existing-review (map-get? campaign-reviews { campaign-id: campaign-id, reviewer: tx-sender }))
+      (current-ratings (default-to { total-rating: u0, review-count: u0, average-rating: u0 } 
+                                   (map-get? campaign-ratings { campaign-id: campaign-id })))
+    )
+    
+    (asserts! (is-none existing-review) err-already-reviewed)
+    (asserts! (not (get is-active campaign)) err-campaign-not-ended)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    (asserts! (> (get amount contribution) u0) err-unauthorized)
+    
+    (map-set campaign-reviews
+      { campaign-id: campaign-id, reviewer: tx-sender }
+      {
+        rating: rating,
+        review-text: review-text,
+        timestamp: stacks-block-height
+      }
+    )
+    
+    (let
+      (
+        (new-total-rating (+ (get total-rating current-ratings) rating))
+        (new-review-count (+ (get review-count current-ratings) u1))
+        (new-average-rating (/ new-total-rating new-review-count))
+      )
+      
+      (map-set campaign-ratings
+        { campaign-id: campaign-id }
+        {
+          total-rating: new-total-rating,
+          review-count: new-review-count,
+          average-rating: new-average-rating
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-campaign-review (campaign-id uint) (reviewer principal))
+  (match (map-get? campaign-reviews { campaign-id: campaign-id, reviewer: reviewer })
+    review (ok review)
+    err-not-found
+  )
+)
+
+(define-read-only (get-campaign-rating (campaign-id uint))
+  (match (map-get? campaign-ratings { campaign-id: campaign-id })
+    rating (ok rating)
+    (ok { total-rating: u0, review-count: u0, average-rating: u0 })
+  )
+)
+
+(define-constant err-refund-already-processed (err u300))
+(define-constant err-refund-not-eligible (err u301))
+(define-constant err-batch-limit-exceeded (err u302))
+
+(define-map campaign-refund-status
+  { campaign-id: uint }
+  {
+    is-refund-enabled: bool,
+    total-refunded: uint,
+    contributors-processed: uint
+  }
+)
+
+(define-map contributor-refund-status
+  { campaign-id: uint, contributor: principal }
+  { is-refunded: bool }
+)
+
+(define-public (enable-campaign-refunds (campaign-id uint))
+  (let
+    (
+      (campaign (unwrap! (get-campaign campaign-id) err-not-found))
+    )
+    
+    (asserts! (or (is-eq tx-sender (get owner campaign)) (is-eq tx-sender contract-owner)) err-unauthorized)
+    (asserts! (not (get is-active campaign)) err-campaign-active)
+    (asserts! (< (get total-raised campaign) (get funding-goal campaign)) err-funding-goal-reached)
+    
+    (map-set campaign-refund-status
+      { campaign-id: campaign-id }
+      {
+        is-refund-enabled: true,
+        total-refunded: u0,
+        contributors-processed: u0
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (batch-process-refunds (campaign-id uint) (contributors (list 20 principal)))
+  (let
+    (
+      (campaign (unwrap! (get-campaign campaign-id) err-not-found))
+      (refund-status (unwrap! (get-campaign-refund-status campaign-id) err-refund-not-eligible))
+    )
+    
+    (asserts! (or (is-eq tx-sender (get owner campaign)) (is-eq tx-sender contract-owner)) err-unauthorized)
+    (asserts! (get is-refund-enabled refund-status) err-refund-not-eligible)
+    (asserts! (<= (len contributors) u20) err-batch-limit-exceeded)
+    
+    (var-set current-batch-campaign-id campaign-id)
+    
+    (let
+      (
+        (refund-results (fold process-refund-for-contributor
+                               contributors
+                               { processed: u0, failed: u0, total-amount: u0 }))
+      )
+      
+      (map-set campaign-refund-status
+        { campaign-id: campaign-id }
+        {
+          is-refund-enabled: (get is-refund-enabled refund-status),
+          total-refunded: (+ (get total-refunded refund-status) (get total-amount refund-results)),
+          contributors-processed: (+ (get contributors-processed refund-status) (get processed refund-results))
+        }
+      )
+      
+      (ok (get processed refund-results))
+    )
+  )
+)
+
+(define-data-var current-batch-campaign-id uint u0)
+
+(define-private (process-refund-for-contributor 
+  (contributor principal) 
+  (acc { processed: uint, failed: uint, total-amount: uint }))
+  (let
+    (
+      (campaign-id (var-get current-batch-campaign-id))
+      (contribution-result (get-contribution campaign-id contributor))
+      (existing-refund-status (map-get? contributor-refund-status { campaign-id: campaign-id, contributor: contributor }))
+    )
+    
+    (if (and (is-ok contribution-result) (is-none existing-refund-status))
+      (let
+        (
+          (contribution (unwrap-panic contribution-result))
+          (amount (get amount contribution))
+        )
+        
+        (if (> amount u0)
+          (begin
+            (map-set contributor-refund-status
+              { campaign-id: campaign-id, contributor: contributor }
+              { is-refunded: true }
+            )
+            
+            (map-set contributions
+              { campaign-id: campaign-id, contributor: contributor }
+              { amount: u0, has-claimed-profit: false }
+            )
+            
+            (match (as-contract (stx-transfer? amount tx-sender contributor))
+              success {
+                processed: (+ (get processed acc) u1),
+                failed: (get failed acc),
+                total-amount: (+ (get total-amount acc) amount)
+              }
+              error {
+                processed: (get processed acc),
+                failed: (+ (get failed acc) u1),
+                total-amount: (get total-amount acc)
+              }
+            )
+          )
+          {
+            processed: (get processed acc),
+            failed: (+ (get failed acc) u1),
+            total-amount: (get total-amount acc)
+          }
+        )
+      )
+      {
+        processed: (get processed acc),
+        failed: (+ (get failed acc) u1),
+        total-amount: (get total-amount acc)
+      }
+    )
+  )
+)
+
+(define-public (check-refund-eligibility (campaign-id uint) (contributor principal))
+  (let
+    (
+      (campaign (unwrap! (get-campaign campaign-id) err-not-found))
+      (contribution-result (get-contribution campaign-id contributor))
+      (refund-status (map-get? contributor-refund-status { campaign-id: campaign-id, contributor: contributor }))
+    )
+    
+    (if (and 
+          (is-ok contribution-result)
+          (not (get is-active campaign))
+          (< (get total-raised campaign) (get funding-goal campaign))
+          (is-none refund-status)
+          (> (get amount (unwrap-panic contribution-result)) u0))
+      (ok true)
+      (ok false)
+    )
+  )
+)
+
+(define-read-only (get-campaign-refund-status (campaign-id uint))
+  (match (map-get? campaign-refund-status { campaign-id: campaign-id })
+    status (ok status)
+    err-not-found
+  )
+)
+
+(define-read-only (get-contributor-refund-status (campaign-id uint) (contributor principal))
+  (match (map-get? contributor-refund-status { campaign-id: campaign-id, contributor: contributor })
+    status (ok status)
+    (ok { is-refunded: false })
   )
 )
