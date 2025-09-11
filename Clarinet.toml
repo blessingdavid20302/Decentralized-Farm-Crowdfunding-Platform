@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/dcp.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.FarmInsurancePool]
+path = 'contracts/FarmInsurancePool.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
